@@ -31,9 +31,9 @@ class CPParams:
     Embedded inside CPState so vmap copies them per episode.
     (Overhead: 3 floats × n_episodes — acceptable per spec §Issue 7.)
     """
-    fee:    jnp.float32 = jnp.float32(0.003)    # 30 bps default
-    init_x: jnp.float32 = jnp.float32(100.0)
-    init_y: jnp.float32 = jnp.float32(10_000.0)
+    fee:    float = 0.003
+    init_x: float = 100.0
+    init_y: float = 10_000.0
 
 
 @chex.dataclass(frozen=True)

@@ -38,18 +38,18 @@ def compute_edge(side: jnp.ndarray,
 
     Formula
     -------
-    AMM sells X (side=0):  edge = delta_x * p - delta_y
+    Trader sells X (side=0, AMM buys y):  edge = delta_y - delta_x * p
         The AMM gave away delta_x units of X worth delta_x*p,
         and received delta_y Y. If delta_y < delta_x*p, AMM lost.
 
-    AMM buys X (side=1):  edge = delta_y - delta_x * p
+    Trader buys X (side=1, AMM sells y):  edge = delta_x * p - delta_y
         The AMM paid delta_y Y and received delta_x X worth delta_x*p.
         If delta_y > delta_x*p, AMM overpaid.
 
     Uses jnp.where so the function is jit/vmap/grad compatible.
     """
-    edge_sell = delta_x * fair_price - delta_y   # AMM sells X
-    edge_buy  = delta_y - delta_x * fair_price   # AMM buys  X
+    edge_sell = delta_y - delta_x * fair_price   # trader sells X (AMM buys Y)
+    edge_buy  = delta_x * fair_price - delta_y   # trader buys  X (AMM sells X)
     return jnp.where(side == 0, edge_sell, edge_buy)
 
 
