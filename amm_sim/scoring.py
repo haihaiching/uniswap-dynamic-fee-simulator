@@ -71,6 +71,6 @@ def compute_edge_batch(sides: jnp.ndarray,
     -------
     edges : (N,) float array
     """
-    edge_sell = delta_xs * fair_price - delta_ys
-    edge_buy  = delta_ys - delta_xs * fair_price
+    edge_sell = delta_ys - delta_xs * fair_price
+    edge_buy  = delta_xs * fair_price - delta_ys
     return jnp.where(sides == 0, edge_sell, edge_buy)
