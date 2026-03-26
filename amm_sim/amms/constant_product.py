@@ -294,26 +294,19 @@ if __name__ == "__main__":
 # ══════════════════════════════════════════════════════════════════
 
 def cp_edge(state: CPState, side: jnp.int32,
-            delta_x: jnp.float32) -> jnp.float32:
+            delta_x: jnp.float32,
+            fair_price: jnp.float32) -> jnp.float32:
     """
-    Compute LP edge for a CP AMM trade using scoring.compute_edge.
+    Compute LP edge for a CP AMM trade.
 
-    This wraps compute_edge in the same interface as linear_edge:
-        (state, side, delta_x) → edge
+    Edge = cash received - fair value of inventory given up.
+    Uses the oracle fair_price (not spot) for correct edge measurement.
 
-    delta_y is computed from the bonding curve before the swap,
-    using the current state (pre-trade).
-    fair_price is approximated as the current spot price —
-    the engine passes the actual fair_price via the CycleRecord,
-    but for per-trade edge we use spot as proxy here.
-
-    Note: for rigorous edge calculation, fair_price should be
-    passed explicitly. This is a known approximation.
+    signature: (state, side, delta_x, fair_price) → edge
     """
     from amm_sim.scoring import compute_edge
     is_buy  = (side == 0)
     dy_buy  = cp_curve_buy(state, delta_x)
     dy_sell = cp_curve_sell(state, delta_x)
     delta_y = jnp.where(is_buy, dy_buy, dy_sell)
-    fair_price = state.reserve_y / state.reserve_x   # spot as proxy
     return compute_edge(side, delta_x, delta_y, fair_price)

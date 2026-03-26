@@ -5,8 +5,8 @@ Edge calculation — the single source of truth for how performance
 is measured throughout the simulator.
 
 Definition (from spec):
-    Edge (AMM sells X) = delta_x * fair_price - delta_y
-    Edge (AMM buys  X) = delta_y - delta_x * fair_price
+    Edge (AMM sells X) = delta_y - delta_x * fair_price
+    Edge (AMM buys  X) = delta_x * fair_price - delta_y 
 
 Positive edge = captured from uninformed retail flow (spread).
 Negative edge = lost to informed arbitrage flow (staleness).
@@ -38,18 +38,18 @@ def compute_edge(side: jnp.ndarray,
 
     Formula
     -------
-    Trader sells X (side=0, AMM buys y):  edge = delta_y - delta_x * p
+    Trader buys X (side=0, AMM sells X):  edge = delta_y - delta_x * p
         The AMM gave away delta_x units of X worth delta_x*p,
         and received delta_y Y. If delta_y < delta_x*p, AMM lost.
 
-    Trader buys X (side=1, AMM sells y):  edge = delta_x * p - delta_y
+    Trader sells X (side=1, AMM buys X):  edge = delta_x * p - delta_y
         The AMM paid delta_y Y and received delta_x X worth delta_x*p.
         If delta_y > delta_x*p, AMM overpaid.
 
     Uses jnp.where so the function is jit/vmap/grad compatible.
     """
-    edge_sell = delta_y - delta_x * fair_price   # trader sells X (AMM buys Y)
-    edge_buy  = delta_x * fair_price - delta_y   # trader buys  X (AMM sells X)
+    edge_sell = delta_y - delta_x * fair_price   # trader buys X (AMM sells X)
+    edge_buy  = delta_x * fair_price - delta_y   # trader sells  X (AMM buys X)
     return jnp.where(side == 0, edge_sell, edge_buy)
 
 

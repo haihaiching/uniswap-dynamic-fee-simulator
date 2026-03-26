@@ -7,11 +7,11 @@ Cycle:  Market Shift → Arbitrage → Retail Flow
 
 Changes in this version:
     - arb_solver signature: (spec, state, fair_price, epsilon) → (side, dx)
-      epsilon is the oracle price move this step, needed by Linear AMM.
-      CP AMM arb solver accepts epsilon but ignores it.
+      * epsilon is the oracle price move this step, needed by Linear AMM.
+      * CP AMM arb solver accepts epsilon but ignores it.
     - Routing: uses route_fn (one per pair of pools) for retail flow.
-      route_fn(state1, state2, side, total_delta) → (delta1, delta2)
-      This supports the Linear AMM analytical optimal split.
+      * route_fn(state1, state2, side, total_delta) → (delta1, delta2)
+      * This supports the Linear AMM analytical optimal split.
 """
 
 import jax
@@ -67,10 +67,63 @@ def default_retail_sampler(key, sim_params):
 # ENGINE FACTORY
 # ══════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════
+# OPTIMAL ROUTING  (numerical bisection, works for any AMM type)
+# ══════════════════════════════════════════════════════════════════
+
+def route_two_pools(spec1, state1, spec2, state2,
+                    side: jnp.ndarray,
+                    total_delta: jnp.ndarray,
+                    n_iter: int = 32):
+    """
+    Optimal two-pool routing via bisection.
+
+    Maximises total output received by taker:
+        Buy  (side=0): max total X received, split Y across pools
+        Sell (side=1): max total Y received, split X across pools
+
+    Bisects on marginal output equality:
+        marginal_output_pool1(d1) = marginal_output_pool2(d2)
+
+    Works for any AMM — only uses spec.curve_buy and spec.curve_sell.
+    Uses lax.fori_loop for JAX compatibility.
+    """
+    is_buy = (side == 0)
+    eps    = total_delta * jnp.float32(1e-5) + jnp.float32(1e-8)
+
+    def get_output(spec, state, delta):
+        return jnp.where(is_buy,
+                         spec.curve_buy(state,  delta),
+                         spec.curve_sell(state, delta))
+
+    def marginal_diff(d1):
+        d2 = total_delta - d1
+        m1 = (get_output(spec1, state1, d1 + eps) - get_output(spec1, state1, d1)) / eps
+        m2 = (get_output(spec2, state2, d2)       - get_output(spec2, state2, d2 - eps)) / eps
+        return m1 - m2
+
+    lo = jnp.float32(0.0)
+    hi = total_delta * jnp.float32(0.9999)
+
+    def bisect_body(i, carry):
+        lo, hi = carry
+        mid   = (lo + hi) * jnp.float32(0.5)
+        f_mid = marginal_diff(mid)
+        lo    = jnp.where(f_mid > 0, mid, lo)
+        hi    = jnp.where(f_mid < 0, mid, hi)
+        return lo, hi
+
+    lo, hi = jax.lax.fori_loop(0, n_iter, bisect_body, (lo, hi))
+    delta1 = jnp.clip((lo + hi) * jnp.float32(0.5), 0.0, total_delta)
+    delta2 = total_delta - delta1
+    return delta1, delta2
+
+
 def make_engine(amm_specs:      list[AMMSpec],
                 arb_solvers:    list[Callable],
-                route_fn:       Callable,
                 edge_fns:       list[Callable],
+                route_fn:       Callable = None,
                 oracle_fn:      Callable = None,
                 retail_sampler: Callable = None):
     """
@@ -100,6 +153,16 @@ def make_engine(amm_specs:      list[AMMSpec],
 
     num_pools = len(amm_specs)   # static, unrolled at trace time
 
+    # If no route_fn provided, use the universal bisection router
+    _spec1, _spec2 = amm_specs[0], amm_specs[1]
+
+    if route_fn is None:
+        def _route_fn(state1, state2, side, total_delta):
+            return route_two_pools(_spec1, state1, _spec2, state2, side, total_delta)
+    else:
+        def _route_fn(state1, state2, side, total_delta):
+            return route_fn(state1, state2, side, total_delta)
+
     def block_step(state: EnvState, sim_params: SimParams):
         key = state.rng_key
         key, k_oracle, k_retail = jax.random.split(key, 3)
@@ -121,7 +184,7 @@ def make_engine(amm_specs:      list[AMMSpec],
             new_s_i, arb_dy = amm_specs[i].swap(
                 amm_states[i], arb_side, arb_dx
             )
-            arb_edge_i = edge_fns[i](amm_states[i], arb_side, arb_dx)
+            arb_edge_i = edge_fns[i](amm_states[i], arb_side, arb_dx, new_fair)
 
             amm_states[i]  = new_s_i
             total_arb_edge = total_arb_edge + arb_edge_i
@@ -144,7 +207,7 @@ def make_engine(amm_specs:      list[AMMSpec],
             active = total_size > 0.0
 
             # Route: optimal split across pools
-            delta1, delta2 = route_fn(sts[0], sts[1], side, total_size)
+            delta1, delta2 = _route_fn(sts[0], sts[1], side, total_size)
 
             deltas = [delta1, delta2]
 
@@ -155,7 +218,7 @@ def make_engine(amm_specs:      list[AMMSpec],
             for j in range(num_pools):
                 delta_j       = deltas[j]
                 new_s_j, dy_j = amm_specs[j].swap(sts[j], side, delta_j)
-                edge_j        = edge_fns[j](sts[j], side, delta_j)
+                edge_j        = edge_fns[j](sts[j], side, delta_j, new_fair)
 
                 # Commit only if slot is active
                 new_sts[j] = jax.tree.map(
@@ -185,7 +248,7 @@ def make_engine(amm_specs:      list[AMMSpec],
             retail_volume=total_ret_vol,
         )
 
-        agent_inventory = amm_states[0].x
+        agent_inventory = amm_states[0].reserve_x
 
         new_state = state.replace(
             amm_states=amm_states,

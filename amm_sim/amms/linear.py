@@ -196,10 +196,10 @@ def linear_swap(state: LinearState, side: jnp.int32,
     # ── Spread state updates ───────────────────────────────────────
     # Buy path
     new_z_plus_buy  = state.z_plus  + delta_x / state.lam_pp
-    new_z_minus_buy = state.z_minus - delta_x / state.lam_mp
+    new_z_minus_buy = state.z_minus + delta_x / state.lam_mp
 
     # Sell path
-    new_z_minus_sell = state.z_minus + delta_x / state.lam_mm
+    new_z_minus_sell = state.z_minus - delta_x / state.lam_mm
     new_z_plus_sell  = state.z_plus  - delta_x / state.lam_pm
 
     new_z_plus  = jnp.where(is_buy, new_z_plus_buy,  new_z_plus_sell)
@@ -214,6 +214,8 @@ def linear_swap(state: LinearState, side: jnp.int32,
         z_minus=new_z_minus,
         x=new_x,
         y=new_y,
+        reserve_x=new_x,   # keep reserve_x in sync with x for engine compatibility
+        reserve_y=new_y,   # keep reserve_y in sync with y
     )
     return new_state, delta_y
 
@@ -300,7 +302,8 @@ def linear_arb_solver(spec: AMMSpec, state: LinearState,
 # ══════════════════════════════════════════════════════════════════
 
 def linear_edge(state: LinearState, side: jnp.int32,
-                delta_x: jnp.float32) -> jnp.float32:
+                delta_x: jnp.float32,
+                fair_price: float = 0.0) -> jnp.float32:
     """
     Compute LP edge for a trade, using pre-trade spread state.
 
@@ -445,10 +448,10 @@ def verify_jax_compatibility():
     assert float(e_retail) > 0, "retail edge (Z+>0) should be positive"
 
     stale = state.replace(z_plus=jnp.float32(-0.3))
-    # arb delta = -lambda++ * Z+ = -0.01 * (-0.3) = 0.003
-    arb_delta = -float(stale.lam_pp) * float(stale.z_plus)
-    e_arb = linear_edge(stale, jnp.int32(0), jnp.float32(arb_delta))
+    e_arb = linear_edge(stale, jnp.int32(0), jnp.float32(1.0))
     assert float(e_arb) < 0, "arb edge (Z+<0) should be negative"
+
+    print("Linear AMM — all JAX compatibility checks passed.")
 
 
 if __name__ == "__main__":

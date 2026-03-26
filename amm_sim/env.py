@@ -54,8 +54,8 @@ def make_obs(state: EnvState, sim_params: SimParams) -> jnp.ndarray:
 def make_env(amm_specs:      list[AMMSpec],
              amm_params:     list,
              arb_solvers:    list[Callable],
-             route_fn:       Callable,
              edge_fns:       list[Callable],
+             route_fn:       Callable = None,
              oracle_fn:      Callable = None,
              retail_sampler: Callable = None):
     """
@@ -75,7 +75,7 @@ def make_env(amm_specs:      list[AMMSpec],
     retail_sampler : optional custom retail sampler
     """
     block_step = make_engine(
-        amm_specs, arb_solvers, route_fn, edge_fns,
+        amm_specs, arb_solvers, edge_fns, route_fn,
         oracle_fn, retail_sampler
     )
     num_pools = len(amm_specs)
