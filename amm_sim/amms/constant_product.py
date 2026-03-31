@@ -246,6 +246,78 @@ def cp_arb_solver(spec: AMMSpec, state: CPState,
 
     return side, delta_x
 
+# ══════════════════════════════════════════════════════════════════
+# EDGE FUNCTION  (interface-compatible with linear_edge)
+# ══════════════════════════════════════════════════════════════════
+
+def cp_edge(state: CPState, side: jnp.int32,
+            delta_x: jnp.float32,
+            fair_price: jnp.float32) -> jnp.float32:
+    """
+    Compute LP edge for a CP AMM trade.
+
+    Edge = cash received - fair value of inventory given up.
+    Uses the oracle fair_price (not spot) for correct edge measurement.
+
+    signature: (state, side, delta_x, fair_price) → edge
+    """
+    from amm_sim.scoring import compute_edge
+    is_buy  = (side == 0)
+    dy_buy  = cp_curve_buy(state, delta_x)
+    dy_sell = cp_curve_sell(state, delta_x)
+    delta_y = jnp.where(is_buy, dy_buy, dy_sell)
+    return compute_edge(side, delta_x, delta_y, fair_price)
+
+# ══════════════════════════════════════════════════════════════════
+# MARGINAL INVERSE FUNCTIONS  (for router.py KKT bisection)
+# ══════════════════════════════════════════════════════════════════
+# Derivation:
+#   Buy:  f(Δ) = (k/(x-Δ) - y) / γ+   →   f'(Δ) = k / (γ+ · (x-Δ)²)
+#         f'⁻¹(ν) = x - √(k / (γ+ · ν))   [clipped to 0]
+#
+#   Sell: f(Δ) = y - k/(x + γ-·Δ)     →   f'(Δ) = k·γ- / (x + γ-·Δ)²
+#         f'⁻¹(ν) = (√(k·γ-/ν) - x) / γ-  [clipped to 0]
+ 
+def cp_marginal_inverse_buy(state: CPState,
+                             nu: jnp.float32) -> jnp.float32:
+    """
+    Analytic fᵢ'⁻¹(ν) for CP AMM buy side.
+ 
+    Derivation:
+        f(Δ) = (k/(x-Δ) - y) / γ+
+        f'(Δ) = k / (γ+ · (x-Δ)²)
+        f'⁻¹(ν) = x - √(k / (γ+ · ν))
+ 
+    Returns 0 when ν ≥ k/(γ+·x²) — pool's marginal output at Δ=0,
+    meaning this pool is too expensive to route to at this shadow price.
+ 
+    Used by router.route_bisection as marginal_inverse_fn.
+    """
+    k     = state.reserve_x * state.reserve_y
+    gp    = state.gamma_plus
+    # avoid division by zero: clip nu to small positive value
+    nu_safe = jnp.maximum(nu, jnp.float32(1e-10))
+    delta = state.reserve_x - jnp.sqrt(k / (gp * nu_safe))
+    return jnp.maximum(delta, 0.0)
+ 
+ 
+def cp_marginal_inverse_sell(state: CPState,
+                              nu: jnp.float32) -> jnp.float32:
+    """
+    Analytic fᵢ'⁻¹(ν) for CP AMM sell side.
+ 
+    Derivation:
+        f(Δ) = y - k/(x + γ-·Δ)
+        f'(Δ) = k·γ- / (x + γ-·Δ)²
+        f'⁻¹(ν) = (√(k·γ-/ν) - x) / γ-
+ 
+    Returns 0 when ν ≥ k·γ-/x² — pool's marginal output at Δ=0.
+    """
+    k   = state.reserve_x * state.reserve_y
+    gm  = state.gamma_minus
+    nu_safe = jnp.maximum(nu, jnp.float32(1e-10))
+    delta = (jnp.sqrt(k * gm / nu_safe) - state.reserve_x) / gm
+    return jnp.maximum(delta, 0.0)
 
 # ══════════════════════════════════════════════════════════════════
 # JAX VERIFICATION
@@ -289,24 +361,3 @@ if __name__ == "__main__":
     verify_jax_compatibility()
 
 
-# ══════════════════════════════════════════════════════════════════
-# EDGE FUNCTION  (interface-compatible with linear_edge)
-# ══════════════════════════════════════════════════════════════════
-
-def cp_edge(state: CPState, side: jnp.int32,
-            delta_x: jnp.float32,
-            fair_price: jnp.float32) -> jnp.float32:
-    """
-    Compute LP edge for a CP AMM trade.
-
-    Edge = cash received - fair value of inventory given up.
-    Uses the oracle fair_price (not spot) for correct edge measurement.
-
-    signature: (state, side, delta_x, fair_price) → edge
-    """
-    from amm_sim.scoring import compute_edge
-    is_buy  = (side == 0)
-    dy_buy  = cp_curve_buy(state, delta_x)
-    dy_sell = cp_curve_sell(state, delta_x)
-    delta_y = jnp.where(is_buy, dy_buy, dy_sell)
-    return compute_edge(side, delta_x, delta_y, fair_price)

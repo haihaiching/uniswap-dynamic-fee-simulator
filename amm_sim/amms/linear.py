@@ -402,6 +402,43 @@ def linear_route_two_pools(state1: LinearState, state2: LinearState,
 
     return delta1, delta2
 
+# ══════════════════════════════════════════════════════════════════
+# MARGINAL INVERSE FUNCTIONS  (for router.py KKT bisection)
+# ══════════════════════════════════════════════════════════════════
+# These provide the analytic fᵢ'⁻¹(ν) needed by route_bisection.
+# Derivation:
+#   Buy:  f(Δ) = (Z+ + Δ/2λ++) · Δ   →  f'(Δ) = Z+ + Δ/λ++
+#         f'⁻¹(ν) = (ν - Z+) / λ++   [clipped to 0]
+#
+#   Sell: f(Δ) = (Z- - Δ/2λ--) · Δ   →  f'(Δ) = Z- - Δ/λ--
+#         f'⁻¹(ν) = (Z- - ν) / λ--   [clipped to 0]
+ 
+def linear_marginal_inverse_buy(state: LinearState,
+                                 nu: jnp.float32) -> jnp.float32:
+    """
+    Analytic fᵢ'⁻¹(ν) for Linear AMM buy side.
+
+    f'(Δ) = Z+ + Δ/λ++   →   f'⁻¹(ν) = (ν - Z+) / λ++
+
+    f'(0) = Z+: pool is active only when ν > Z+.
+    Clipped to [0, 1e4] to prevent numerical overflow at large ν.
+    """
+    delta = (nu - state.z_plus) / state.lam_pp
+    return jnp.clip(delta, 0.0, jnp.float32(1e4))
+
+
+def linear_marginal_inverse_sell(state: LinearState,
+                                  nu: jnp.float32) -> jnp.float32:
+    """
+    Analytic fᵢ'⁻¹(ν) for Linear AMM sell side.
+
+    f'(Δ) = Z- - Δ/λ--   →   f'⁻¹(ν) = (Z- - ν) / λ--
+
+    f'(0) = Z-: pool is active only when ν < Z-.
+    Clipped to [0, 1e4] to prevent numerical overflow.
+    """
+    delta = (state.z_minus - nu) / state.lam_mm
+    return jnp.clip(delta, 0.0, jnp.float32(1e4))
 
 # ══════════════════════════════════════════════════════════════════
 # JAX VERIFICATION

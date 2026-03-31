@@ -1,17 +1,16 @@
 """
 amm_sim/env.py
 ==============
-Environment wrapper. Gymnax-compatible API:
+Gymnax-compatible environment wrapper around the engine.
 
-    reset(key, sim_params) → (obs, state)
-    step(state, action, sim_params) → (obs, state, reward, done, info)
-    rollout(key, sim_params) → (final_state, trajectory)
-    batch_rollout(keys, sim_params) → (final_states, trajectories)
+API:
+    reset(key, sim_params)                    → (obs, state)
+    step(state, action, sim_params)           → (obs, state, reward, done, info)
+    rollout(key, sim_params, policy_fn=None)  → (final_state, trajectory)
+    batch_rollout(keys, sim_params)           → (final_states, trajectories)
 
-make_env() is the main entry point.
-
-Works with any AMM type that has reserve_x and reserve_y fields
-(both CP AMM and Linear AMM satisfy this after v2 update).
+Works with any AMM type that exposes reserve_x and reserve_y fields.
+Both CP AMM and Linear AMM satisfy this requirement.
 """
 
 import jax
@@ -25,67 +24,79 @@ from amm_sim.types import SimParams, EnvState, CycleRecord, zero_metrics
 from amm_sim.engine import make_engine
 
 
-# ══════════════════════════════════════════════════════════════════
-# OBSERVATION BUILDER
-# ══════════════════════════════════════════════════════════════════
+# ── Observation builder ────────────────────────────────────────────────────
 
 def make_obs(state: EnvState, sim_params: SimParams) -> jnp.ndarray:
     """
-    Build a 3-dim observation compatible with all AMM types.
+    Build the observation vector from current environment state.
 
-    obs = [fair_price, inventory (reserve_x), time_fraction]
+    obs = [fair_price, reserve_x (inventory proxy), time_fraction]
+    obs_dim = 3 — fixed shape required for vmap over episodes.
 
-    Both CP AMM and Linear AMM expose reserve_x.
+    Intentionally minimal: only fields that exist in both CP and Linear AMM.
+    Extend this for RL training by adding AMM-specific fields as needed.
     """
     pool0     = state.amm_states[0]
     time_frac = state.step_idx.astype(jnp.float32) / sim_params.num_steps
 
     return jnp.array([
-        state.fair_price,
-        pool0.reserve_x,
-        time_frac,
+        state.fair_price,   # oracle price — the "true" external price
+        pool0.reserve_x,    # inventory of pool 0 (agent's pool)
+                            # CP AMM: X token reserves
+                            # Linear AMM: kept in sync with x (inventory) in swap
+        time_frac,          # how far through the episode we are (0 to 1)
     ], dtype=jnp.float32)
 
 
-# ══════════════════════════════════════════════════════════════════
-# ENV FACTORY
-# ══════════════════════════════════════════════════════════════════
+# ── Environment factory ────────────────────────────────────────────────────
 
-def make_env(amm_specs:      list[AMMSpec],
-             amm_params:     list,
-             arb_solvers:    list[Callable],
-             edge_fns:       list[Callable],
-             route_fn:       Callable = None,
-             oracle_fn:      Callable = None,
-             retail_sampler: Callable = None):
+def make_env(amm_specs:            list[AMMSpec],
+             amm_params:            list,
+             arb_solvers:           list[Callable],
+             edge_fns:              list[Callable],
+             marginal_inverse_fns:  list = None,
+             oracle_fn:             Callable = None,
+             retail_sampler:        Callable = None):
     """
-    Build the environment.
+    Build the simulation environment.
 
     Parameters
     ----------
-    amm_specs      : list of AMMSpec (one per pool)
-    amm_params     : list of params objects for each spec.init
-    arb_solvers    : list of arb solver functions (one per pool)
-                     signature: (spec, state, fair_price, epsilon) → (side, dx)
-    route_fn       : routing function
-                     signature: (state1, state2, side, total_delta) → (d1, d2)
-    edge_fns       : list of edge functions (one per pool)
-                     signature: (state, side, delta_x) → edge
-    oracle_fn      : optional custom oracle
-    retail_sampler : optional custom retail sampler
+    amm_specs             : list of AMMSpec (one per pool)
+    amm_params            : initial params for each AMM (passed to spec.init)
+    arb_solvers           : arb solver per pool — (spec, state, fair_price, epsilon) → (side, dx)
+    edge_fns              : edge function per pool — (state, side, delta_x, fair_price) → edge
+    marginal_inverse_fns  : optional list of (buy_inv_fn, sell_inv_fn) per pool
+                            Enables KKT-optimal routing via route_bisection.
+                            If None: falls back to route_bisection_numerical.
+    oracle_fn             : optional custom oracle (defaults to GBM)
+    retail_sampler        : optional custom order sampler (defaults to Poisson-LogNormal)
+
+    Returns
+    -------
+    env object with .reset / .step / .rollout / .batch_rollout / .block_step
     """
+    # Build the jit-compiled step function from the engine
     block_step = make_engine(
-        amm_specs, arb_solvers, edge_fns, route_fn,
+        amm_specs, arb_solvers, edge_fns, marginal_inverse_fns,
         oracle_fn, retail_sampler
     )
     num_pools = len(amm_specs)
 
-    # ── reset ──────────────────────────────────────────────────────
     def reset(key, sim_params):
+        """
+        Initialise all AMM states for a new episode.
+
+        Initial fair price = reserve_y / reserve_x of pool 0.
+        This works for both AMM types:
+          CP AMM:     reserve_y / reserve_x = initial spot price
+          Linear AMM: reserve_y / reserve_x = init_y / init_x (set in params)
+        """
         key, subkey = jax.random.split(key)
+        # Call each AMM's init function with its params
         init_states = [amm_specs[i].init(amm_params[i]) for i in range(num_pools)]
         s0 = init_states[0]
-        p0 = s0.reserve_y / s0.reserve_x   # works for both AMM types
+        p0 = s0.reserve_y / s0.reserve_x   # initial fair price
 
         state = EnvState(
             amm_states=init_states,
@@ -96,28 +107,40 @@ def make_env(amm_specs:      list[AMMSpec],
         )
         return make_obs(state, sim_params), state
 
-    # ── step ───────────────────────────────────────────────────────
     def step(state, action, sim_params):
         """
-        action is accepted for Gymnax compatibility but not applied
-        to AMM state here — use a policy_fn in rollout() to update
-        AMM parameters before each step.
+        Run one simulation cycle.
+
+        action is accepted for Gymnax API compatibility but currently
+        not applied — AMM parameters stay fixed unless a policy_fn
+        explicitly modifies state before calling block_step.
+
+        Returns (obs, new_state, reward, done, info) where:
+          reward = total_edge - phi * inventory²
+          info   = CycleRecord (arb_edge, retail_edge, fair_price, etc.)
         """
         new_state, record = block_step(state, sim_params)
 
         obs    = make_obs(new_state, sim_params)
         done   = new_state.step_idx >= sim_params.num_steps
+        # reward = edge minus inventory penalty (phi=0 → pure edge maximisation)
         reward = record.total_edge - sim_params.phi * new_state.metrics.inventory**2
 
         return obs, new_state, reward, done, record
 
-    # ── rollout ────────────────────────────────────────────────────
     def rollout(key, sim_params, policy_fn=None):
         """
-        Run a full episode via lax.scan.
+        Run a full episode of num_steps cycles via lax.scan.
+
+        lax.scan replaces a Python for loop — the entire episode is
+        compiled into a single XLA computation, which is much faster
+        than calling step() in a Python loop.
 
         policy_fn(obs, key) → action  (optional)
-        If None, AMM parameters are held fixed throughout.
+        If None, all AMM parameters stay fixed throughout the episode.
+
+        Returns (final_state, trajectory) where trajectory is a
+        CycleRecord with each field having shape (num_steps,).
         """
         _, init_state = reset(key, sim_params)
 
@@ -128,25 +151,36 @@ def make_env(amm_specs:      list[AMMSpec],
             action = policy_fn(obs, act_key) if policy_fn is not None \
                      else jnp.zeros(2, dtype=jnp.float32)
             _, new_state, reward, done, record = step(state, action, sim_params)
-            return (new_state, rng), record
+            return (new_state, rng), record   # record accumulated by lax.scan
 
         (final_state, _), trajectory = jax.lax.scan(
             scan_step,
             (init_state, key),
             None,
-            length=sim_params.num_steps,
+            length=sim_params.num_steps,   # static length required by lax.scan
         )
         return final_state, trajectory
 
-    # ── batch_rollout ──────────────────────────────────────────────
     def batch_rollout(keys, sim_params, policy_fn=None):
-        """Run N independent episodes in parallel via vmap."""
+        """
+        Run N independent episodes in parallel via vmap.
+
+        keys: (N, 2) array — one PRNG key per episode.
+
+        vmap transforms rollout() to operate over a batch of keys simultaneously.
+        All N episodes run in a single GPU forward pass — this is where
+        the simulator's speed advantage over CPU-based simulators comes from.
+
+        Returns (final_states, trajectories) where each trajectory field
+        has shape (N, num_steps).
+        """
         batched = vmap(
             partial(rollout, sim_params=sim_params, policy_fn=policy_fn),
-            in_axes=0
+            in_axes=0   # vectorise over the first axis (batch of keys)
         )
         return batched(keys)
 
+    # Package into a simple namespace object
     class Env:
         pass
 
@@ -155,6 +189,6 @@ def make_env(amm_specs:      list[AMMSpec],
     env.step          = step
     env.rollout       = rollout
     env.batch_rollout = batch_rollout
-    env.block_step    = block_step
+    env.block_step    = block_step   # expose raw block_step for debugging
 
     return env

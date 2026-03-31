@@ -3,15 +3,26 @@ amm_sim/engine.py
 =================
 Simulation engine. make_engine() returns a jit-compiled block_step.
 
-Cycle:  Market Shift → Arbitrage → Retail Flow
+One simulation cycle (block_step) runs three sub-steps in order:
 
-Changes in this version:
-    - arb_solver signature: (spec, state, fair_price, epsilon) → (side, dx)
-      * epsilon is the oracle price move this step, needed by Linear AMM.
-      * CP AMM arb solver accepts epsilon but ignores it.
-    - Routing: uses route_fn (one per pair of pools) for retail flow.
-      * route_fn(state1, state2, side, total_delta) → (delta1, delta2)
-      * This supports the Linear AMM analytical optimal split.
+    Step A — Oracle:    fair price moves via GBM, returns epsilon
+    Step B — Arb:       each pool corrects stale prices independently (closed-form)
+    Step C — Retail:    taker orders arrive, routed optimally via KKT bisection
+
+Function signatures required by each pluggable component:
+
+    arb_solver : (spec, state, fair_price, epsilon) → (side, delta_x)
+        epsilon is the oracle log-return this step.
+        Each AMM implements its own arb logic in amms/.
+
+    edge_fn    : (state, side, delta_x, fair_price) → edge
+        Each AMM implements its own edge formula in amms/.
+        edge = cash received - fair value of inventory given up.
+
+    routing    : handled by router.py, not per-AMM.
+        If marginal_inverse_fns provided → route_bisection (KKT-optimal, N pools).
+        Otherwise → route_bisection_numerical (works for any AMM via jax.grad).
+        Both work for any number of pools — no per-AMM routing logic needed.
 """
 
 import jax
@@ -22,30 +33,40 @@ from typing import Callable
 from amm_sim.spec import AMMSpec
 from amm_sim.types import SimParams, EnvState, CycleRecord, update_metrics
 from amm_sim.scoring import compute_edge
+from amm_sim.router import route_bisection, route_bisection_numerical
 
 
-# ══════════════════════════════════════════════════════════════════
-# DEFAULT PLUGGABLE COMPONENTS
-# ══════════════════════════════════════════════════════════════════
+# ── Default oracle ─────────────────────────────────────────────────────────
 
 def default_oracle(fair_price, key, sim_params):
     """
-    Zero-drift GBM.
-    Returns (epsilon, new_price, key).
+    Zero-drift GBM: p(t+1) = p(t) * exp(-σ²/2 + σZ), Z ~ N(0,1).
+
+    Returns (epsilon, new_price, key) where epsilon is the log return.
+    epsilon is passed to arb solvers — Linear AMM uses it directly
+    to compute how far spreads shifted this step.
     """
     key, subkey = jax.random.split(key)
     Z         = jax.random.normal(subkey)
     sigma     = sim_params.sigma
-    epsilon   = -0.5 * sigma**2 + sigma * Z
+    epsilon   = -0.5 * sigma**2 + sigma * Z   # log return
     new_price = fair_price * jnp.exp(epsilon)
     return epsilon, new_price, key
 
 
+# ── Default retail sampler ─────────────────────────────────────────────────
+
 def default_retail_sampler(key, sim_params):
     """
-    Poisson arrivals, LogNormal sizes.
-    Returns fixed-length arrays (sides, sizes) of length max_orders.
-    Inactive slots have size=0 (no-op).
+    Generate retail orders for one step.
+
+    Arrival count: N ~ Poisson(lam), clipped to max_orders (static shape).
+    Size:          Y ~ LogNormal(mu, sigma_ln).
+    Direction:     50% buy (side=0), 50% sell (side=1).
+
+    Always returns arrays of length max_orders. Inactive slots have
+    size=0. When delta_x=0, swap is a no-op — reserves unchanged, edge=0.
+    This is the JAX-compatible way to handle variable-length sequences.
     """
     M = sim_params.max_orders
     key, k1, k2, k3 = jax.random.split(key, 4)
@@ -54,190 +75,160 @@ def default_retail_sampler(key, sim_params):
     n     = jnp.minimum(n_raw, M).astype(jnp.int32)
 
     Z     = jax.random.normal(k2, shape=(M,))
-    sizes = jnp.exp(sim_params.mu + sim_params.sigma_ln * Z)
+    sizes = jnp.exp(sim_params.mu + sim_params.sigma_ln * Z)   # LogNormal sizes
     sides = jax.random.bernoulli(k3, p=0.5, shape=(M,)).astype(jnp.int32)
 
+    # Zero out inactive slots — size=0 → no-op swap
     mask  = (jnp.arange(M) < n).astype(jnp.float32)
     sizes = sizes * mask
 
     return sides, sizes, key
 
 
-# ══════════════════════════════════════════════════════════════════
-# ENGINE FACTORY
-# ══════════════════════════════════════════════════════════════════
 
 
-# ══════════════════════════════════════════════════════════════════
-# OPTIMAL ROUTING  (numerical bisection, works for any AMM type)
-# ══════════════════════════════════════════════════════════════════
-
-def route_two_pools(spec1, state1, spec2, state2,
-                    side: jnp.ndarray,
-                    total_delta: jnp.ndarray,
-                    n_iter: int = 32):
-    """
-    Optimal two-pool routing via bisection.
-
-    Maximises total output received by taker:
-        Buy  (side=0): max total X received, split Y across pools
-        Sell (side=1): max total Y received, split X across pools
-
-    Bisects on marginal output equality:
-        marginal_output_pool1(d1) = marginal_output_pool2(d2)
-
-    Works for any AMM — only uses spec.curve_buy and spec.curve_sell.
-    Uses lax.fori_loop for JAX compatibility.
-    """
-    is_buy = (side == 0)
-    eps    = total_delta * jnp.float32(1e-5) + jnp.float32(1e-8)
-
-    def get_output(spec, state, delta):
-        return jnp.where(is_buy,
-                         spec.curve_buy(state,  delta),
-                         spec.curve_sell(state, delta))
-
-    def marginal_diff(d1):
-        d2 = total_delta - d1
-        m1 = (get_output(spec1, state1, d1 + eps) - get_output(spec1, state1, d1)) / eps
-        m2 = (get_output(spec2, state2, d2)       - get_output(spec2, state2, d2 - eps)) / eps
-        return m1 - m2
-
-    lo = jnp.float32(0.0)
-    hi = total_delta * jnp.float32(0.9999)
-
-    def bisect_body(i, carry):
-        lo, hi = carry
-        mid   = (lo + hi) * jnp.float32(0.5)
-        f_mid = marginal_diff(mid)
-        lo    = jnp.where(f_mid > 0, mid, lo)
-        hi    = jnp.where(f_mid < 0, mid, hi)
-        return lo, hi
-
-    lo, hi = jax.lax.fori_loop(0, n_iter, bisect_body, (lo, hi))
-    delta1 = jnp.clip((lo + hi) * jnp.float32(0.5), 0.0, total_delta)
-    delta2 = total_delta - delta1
-    return delta1, delta2
-
-
-def make_engine(amm_specs:      list[AMMSpec],
-                arb_solvers:    list[Callable],
-                edge_fns:       list[Callable],
-                route_fn:       Callable = None,
-                oracle_fn:      Callable = None,
-                retail_sampler: Callable = None):
+def make_engine(amm_specs:            list[AMMSpec],
+                arb_solvers:          list[Callable],
+                edge_fns:             list[Callable],
+                marginal_inverse_fns: list = None,
+                oracle_fn:            Callable = None,
+                retail_sampler:       Callable = None):
     """
     Build and return a jit-compiled block_step function.
 
     Parameters
     ----------
-    amm_specs      : list of AMMSpec, one per pool (static length = 2)
-    arb_solvers    : list of arb solver functions, one per pool
-                     signature: (spec, state, fair_price, epsilon) → (side, dx)
-    route_fn       : routing function for retail orders
-                     signature: (state1, state2, side, total_delta)
-                                → (delta1, delta2)
-    edge_fns       : list of edge functions, one per pool
-                     signature: (state, side, delta_x) → edge
-    oracle_fn      : (price, key, params) → (epsilon, new_price, key)
-    retail_sampler : (key, params) → (sides, sizes, key)
+    amm_specs             : list of AMMSpec (one per pool)
+    arb_solvers           : arb solver per pool — (spec, state, fair_price, epsilon) → (side, dx)
+    edge_fns              : edge function per pool — (state, side, delta_x, fair_price) → edge
+    marginal_inverse_fns  : optional list of (buy_inv_fn, sell_inv_fn) per pool
+                            buy_inv_fn(state, nu) → delta
+                            sell_inv_fn(state, nu) → delta
+                            If provided: uses route_bisection (KKT-optimal).
+                            If None: uses route_bisection_numerical (fallback, any AMM).
+    oracle_fn             : optional custom oracle — defaults to GBM
+    retail_sampler        : optional custom sampler — defaults to Poisson-LogNormal
 
     Returns
     -------
-    block_step : (EnvState, SimParams) → (EnvState, CycleRecord)
+    block_step : jit-compiled (EnvState, SimParams) → (EnvState, CycleRecord)
     """
     if oracle_fn is None:
         oracle_fn = default_oracle
     if retail_sampler is None:
         retail_sampler = default_retail_sampler
 
-    num_pools = len(amm_specs)   # static, unrolled at trace time
+    num_pools = len(amm_specs)   # static integer — Python loop unrolled at trace time
 
-    # If no route_fn provided, use the universal bisection router
-    _spec1, _spec2 = amm_specs[0], amm_specs[1]
-
-    if route_fn is None:
-        def _route_fn(state1, state2, side, total_delta):
-            return route_two_pools(_spec1, state1, _spec2, state2, side, total_delta)
+    # ── Build routing function ────────────────────────────────────────────
+    # Routing: marginal_inverse_fns (KKT analytic) > numerical fallback
+    # Works for N pools — Python loop unrolled at trace time (num_pools static)
+ 
+    if marginal_inverse_fns is not None:
+        # Analytic: each pool provides (buy_inv_fn, sell_inv_fn)
+        # Returns list of N deltas
+        def _route_fn(states, side, total_delta):
+            is_buy = (side == 0)
+            inv_fns = [
+                lambda nu, i=i: jnp.where(
+                    is_buy,
+                    marginal_inverse_fns[i][0](states[i], nu),   # buy inverse
+                    marginal_inverse_fns[i][1](states[i], nu),   # sell inverse
+                )
+                for i in range(num_pools)
+            ]
+            splits, _ = route_bisection(inv_fns, total_delta, nu_hi=1e4)
+            return splits
+ 
     else:
-        def _route_fn(state1, state2, side, total_delta):
-            return route_fn(state1, state2, side, total_delta)
+        # Numerical fallback: works for any AMM type
+        def _route_fn(states, side, total_delta):
+            splits, _ = route_bisection_numerical(
+                amm_specs, states, side, total_delta
+            )
+            return splits
 
     def block_step(state: EnvState, sim_params: SimParams):
+        """
+        One full simulation cycle. Called N times via lax.scan for a rollout.
+
+        Step A: Oracle moves fair price by GBM.
+        Step B: Each pool's arb solver corrects stale prices independently.
+        Step C: Retail orders arrive, get split optimally, each pool executes.
+        Step D: Package results into CycleRecord, update EnvState.
+        """
         key = state.rng_key
         key, k_oracle, k_retail = jax.random.split(key, 3)
 
-        # ── Step A: Oracle ─────────────────────────────────────────
+        # ── Step A: Oracle ─────────────────────────────────────────────────
+        # epsilon = log return this step (used by Linear AMM arb solver)
         epsilon, new_fair, _ = oracle_fn(state.fair_price, k_oracle, sim_params)
 
-        # ── Step B: Arbitrage (one per pool, unrolled) ─────────────
+        # ── Step B: Arbitrage ──────────────────────────────────────────────
+        # Each pool corrected independently — no interaction between pools during arb.
+        # Python loop is unrolled at trace time (num_pools is static).
         amm_states     = list(state.amm_states)
         total_arb_edge = jnp.float32(0.0)
         total_arb_vol  = jnp.float32(0.0)
 
         for i in range(num_pools):
-            # Pass epsilon to arb solver — Linear AMM uses it,
-            # CP AMM accepts it but ignores it
-            arb_side, arb_dx = arb_solvers[i](
-                amm_specs[i], amm_states[i], new_fair, epsilon
-            )
-            new_s_i, arb_dy = amm_specs[i].swap(
-                amm_states[i], arb_side, arb_dx
-            )
-            arb_edge_i = edge_fns[i](amm_states[i], arb_side, arb_dx, new_fair)
+            # epsilon passed to all arb solvers — Linear AMM uses it, CP AMM ignores it
+            arb_side, arb_dx = arb_solvers[i](amm_specs[i], amm_states[i], new_fair, epsilon)
+            new_s_i, arb_dy  = amm_specs[i].swap(amm_states[i], arb_side, arb_dx)
+            # edge computed on pre-trade state (before swap changes reserves)
+            arb_edge_i       = edge_fns[i](amm_states[i], arb_side, arb_dx, new_fair)
 
             amm_states[i]  = new_s_i
             total_arb_edge = total_arb_edge + arb_edge_i
             total_arb_vol  = total_arb_vol  + arb_dx
 
-        # ── Step C: Retail flow (lax.scan) ─────────────────────────
+        # ── Step C: Retail flow ────────────────────────────────────────────
+        # lax.scan over fixed-length order array (max_orders slots, inactive ones masked)
         sides, sizes, _ = retail_sampler(k_retail, sim_params)
 
         def process_order(carry, order):
             """
             Process one retail order slot.
 
-            1. route_fn splits total_delta across pools.
-            2. Each pool executes its own delta independently.
-            3. Edge computed via each pool's edge_fn.
-            Inactive slots (size=0) are no-ops.
+            1. _route_fn finds optimal delta split (d1, d2) for this order.
+            2. Each pool executes its delta independently.
+            3. Edge computed on pre-trade state for accuracy.
+            4. State updates masked to zero for inactive slots (size=0).
             """
             sts, ret_edge, ret_vol = carry
             side, total_size = order
-            active = total_size > 0.0
+            active = total_size > 0.0   # False for zero-masked (inactive) slots
 
-            # Route: optimal split across pools
-            delta1, delta2 = _route_fn(sts[0], sts[1], side, total_size)
+            # Optimal split: maximises taker's total output
+            deltas = _route_fn(sts, side, total_size)
 
-            deltas = [delta1, delta2]
-
-            # Execute on each pool
             new_sts    = list(sts)
             order_edge = jnp.float32(0.0)
 
             for j in range(num_pools):
                 delta_j       = deltas[j]
                 new_s_j, dy_j = amm_specs[j].swap(sts[j], side, delta_j)
+                # Use pre-trade state for edge calculation
                 edge_j        = edge_fns[j](sts[j], side, delta_j, new_fair)
 
-                # Commit only if slot is active
+                # jnp.where mask: inactive slots keep old state unchanged
+                # (JAX Issue 3 fix: no dynamic indexing into Python list)
                 new_sts[j] = jax.tree.map(
                     lambda n, o: jnp.where(active, n, o),
                     new_s_j, sts[j]
                 )
-                order_edge = order_edge + edge_j * active
+                order_edge = order_edge + edge_j * active   # zero for inactive slots
 
-            return (new_sts, ret_edge + order_edge,
-                    ret_vol + total_size * active), None
+            return (new_sts, ret_edge + order_edge, ret_vol + total_size * active), None
 
         init_carry = (amm_states, jnp.float32(0.0), jnp.float32(0.0))
         (amm_states, total_ret_edge, total_ret_vol), _ = jax.lax.scan(
             process_order,
             init_carry,
-            (sides, sizes),
+            (sides, sizes),   # scanned over max_orders slots
         )
 
-        # ── Step D: Package ────────────────────────────────────────
+        # ── Step D: Package ────────────────────────────────────────────────
         record = CycleRecord(
             fair_price=new_fair,
             epsilon=epsilon,
@@ -248,6 +239,7 @@ def make_engine(amm_specs:      list[AMMSpec],
             retail_volume=total_ret_vol,
         )
 
+        # reserve_x is the common inventory field for both AMM types
         agent_inventory = amm_states[0].reserve_x
 
         new_state = state.replace(
@@ -260,4 +252,5 @@ def make_engine(amm_specs:      list[AMMSpec],
 
         return new_state, record
 
+    # jit-compile with sim_params as static arg (controls loop lengths)
     return jit(block_step, static_argnums=(1,))
