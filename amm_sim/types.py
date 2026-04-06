@@ -51,25 +51,31 @@ class SimParams:
 class CycleRecord:
     """
     Output of one simulation cycle (block_step).
-    All fields are scalar JAX arrays.
+    Scalar fields are aggregated across all pools.
+    Per-pool fields have shape (num_pools,) and are stacked to
+    (num_steps, num_pools) by lax.scan.
 
     Attributes
     ----------
-    fair_price   : oracle price at end of this cycle
-    epsilon      : oracle price move this cycle
-    arb_edge     : total arb edge across all pools (≤ 0)
-    retail_edge  : total retail edge across all pools (≥ 0 typically)
-    total_edge   : arb_edge + retail_edge
-    arb_volume   : total X volume from arbitrage
-    retail_volume: total X volume from retail orders
+    fair_price            : oracle price at end of this cycle
+    epsilon               : oracle price move this cycle
+    arb_edge              : total arb edge across all pools (≤ 0)
+    retail_edge           : total retail edge across all pools (≥ 0 typically)
+    total_edge            : arb_edge + retail_edge
+    arb_volume            : total X volume from arbitrage
+    retail_volume         : total X volume from retail orders
+    arb_edges_per_pool    : per-pool arb edge, shape (num_pools,)
+    retail_edges_per_pool : per-pool retail edge, shape (num_pools,)
     """
-    fair_price:    jnp.ndarray   # scalar
-    epsilon:       jnp.ndarray   # scalar
-    arb_edge:      jnp.ndarray   # scalar, ≤ 0
-    retail_edge:   jnp.ndarray   # scalar
-    total_edge:    jnp.ndarray   # scalar
-    arb_volume:    jnp.ndarray   # scalar
-    retail_volume: jnp.ndarray   # scalar
+    fair_price:            jnp.ndarray   # scalar
+    epsilon:               jnp.ndarray   # scalar
+    arb_edge:              jnp.ndarray   # scalar, ≤ 0
+    retail_edge:           jnp.ndarray   # scalar
+    total_edge:            jnp.ndarray   # scalar
+    arb_volume:            jnp.ndarray   # scalar
+    retail_volume:         jnp.ndarray   # scalar
+    arb_edges_per_pool:    jnp.ndarray   # shape (num_pools,)
+    retail_edges_per_pool: jnp.ndarray   # shape (num_pools,)
 
 
 # ══════════════════════════════════════════════════════════════════
