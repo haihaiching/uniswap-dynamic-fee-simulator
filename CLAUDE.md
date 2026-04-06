@@ -8,7 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python -m amm_sim.sanity_check
 ```
-This verifies JAX compatibility (jit/vmap/grad), confirms arb edge ≤ 0 in all steps, runs 50-episode batch rollouts, and prints throughput (steps/sec).
+Runs per-AMM checks via `check_amm(spec, params, name, check_retail_after_arb=True)`:
+1. **Arb edge always ≤ 0** — verified on every step of a single rollout.
+2. **First retail edge after arb ≥ 0** — checked only in steps where `arb_volume > 0`. Skipped for AMMs with cross-impact (pass `check_retail_after_arb=False`) where a sell arb can drag the ask below fair — known model behaviour.
+3. Two identical pools produce equal routing splits.
+4. `batch_rollout` 100 episodes without error.
+5. Timing benchmark.
 
 **Run a notebook:**
 ```bash
@@ -66,7 +71,7 @@ make_env(amm_specs, amm_params, ...)
 ### [amm_sim/spec.py](amm_sim/spec.py) — AMM interface
 
 **`AMMSpec`** *(NamedTuple)*  
-The only interface the engine, arb, and router use. All four fields are callables:
+The only interface the engine, arb, and router use. All six fields are callables:
 
 | Field | Signature | Description |
 |---|---|---|
@@ -74,12 +79,14 @@ The only interface the engine, arb, and router use. All four fields are callable
 | `curve_buy` | `(state, delta_x: f32) → delta_y: f32` | Read-only: Y cost for buying delta_x of X |
 | `curve_sell` | `(state, delta_x: f32) → delta_y: f32` | Read-only: Y received for selling delta_x of X |
 | `swap` | `(state, side: i32, delta_x: f32) → (state', delta_y: f32)` | Execute trade, update state. side=0 buy, side=1 sell |
+| `max_trade_buy` | `(state) → f32` | Max delta_x the AMM accepts on the buy side |
+| `max_trade_sell` | `(state) → f32` | Max delta_x the AMM accepts on the sell side |
 
-**`marginal_ask(spec, state) → f32`**  
-Exact marginal ask price at zero trade size via `jax.grad(spec.curve_buy, argnums=1)(state, 0.0)`.
+**`marginal_ask(spec, state, delta_x=0.0) → f32`**  
+Exact marginal ask price after purchasing `delta_x` units of X, via `jax.grad(spec.curve_buy, argnums=1)(state, delta_x)`. Defaults to `delta_x=0` (spot price before any trade).
 
-**`marginal_bid(spec, state) → f32`**  
-Exact marginal bid price at zero trade size via `jax.grad(spec.curve_sell, argnums=1)(state, 0.0)`.
+**`marginal_bid(spec, state, delta_x=0.0) → f32`**  
+Exact marginal bid price after selling `delta_x` units of X, via `jax.grad(spec.curve_sell, argnums=1)(state, delta_x)`. Defaults to `delta_x=0` (spot price before any trade).
 
 ---
 
@@ -112,17 +119,19 @@ Full simulator state passed through every `block_step` call.
 | `metrics` | `Metrics` | Running accumulators |
 
 **`CycleRecord`**  
-Output of one `block_step`. All scalar f32 arrays. Stacked by `lax.scan` into shape `(num_steps,)` across a rollout.
+Output of one `block_step`. Scalar fields are stacked by `lax.scan` into shape `(num_steps,)`; per-pool array fields into shape `(num_steps, num_pools)`.
 
-| Field | Sign | Description |
-|---|---|---|
-| `fair_price` | — | Oracle price at end of cycle |
-| `epsilon` | — | Oracle log-return this cycle |
-| `arb_edge` | ≤ 0 | LP loss to arbitrage across all pools |
-| `retail_edge` | ≥ 0 | LP gain from retail flow across all pools |
-| `total_edge` | — | `arb_edge + retail_edge` |
-| `arb_volume` | — | Total X volume from arb |
-| `retail_volume` | — | Total X volume from retail |
+| Field | Shape | Sign | Description |
+|---|---|---|---|
+| `fair_price` | scalar | — | Oracle price at end of cycle |
+| `epsilon` | scalar | — | Oracle log-return this cycle |
+| `arb_edge` | scalar | ≤ 0 | LP loss to arbitrage across all pools |
+| `retail_edge` | scalar | — | LP gain from retail flow across all pools |
+| `total_edge` | scalar | — | `arb_edge + retail_edge` |
+| `arb_volume` | scalar | — | Total X volume from arb |
+| `retail_volume` | scalar | — | Total X volume from retail |
+| `arb_edges_per_pool` | `(num_pools,)` | — | Per-pool arb edge |
+| `retail_edges_per_pool` | `(num_pools,)` | — | Per-pool retail edge |
 
 **`Metrics`**  
 Cumulative accumulators updated every step inside `EnvState`.
@@ -142,17 +151,18 @@ Adds one `CycleRecord` into running `Metrics`. Called at end of each `block_step
 
 ---
 
-### [amm_sim/arb.py](amm_sim/arb.py) — Generic arbitrage solver *(new)*
+### [amm_sim/arb.py](amm_sim/arb.py) — Generic arbitrage solver
 
-**`generic_arb_solver(spec, state, fair_price, epsilon=0.0) → (side: i32, delta_x: f32)`**
+**`generic_arb_solver(spec, state, fair_price, num_iters=100, tol=1e-6) → (side: i32, delta_x: f32)`**
 
-Single arb solver that works for any AMM using only `AMMSpec`. No per-AMM code.
+Single arb solver that works for any AMM using only `AMMSpec`.
 
-- **Buy arb** when `marginal_ask(spec, state) < fair_price`: find `delta_x` via bisection on `delta_x` such that the post-trade marginal ask equals `fair_price`.
-- **Sell arb** when `marginal_bid(spec, state) > fair_price`: find `delta_x` via bisection such that the post-trade marginal bid equals `fair_price`.
-- Uses `jax.grad(spec.curve_buy/sell, argnums=1)` for exact marginal prices at each bisection step.
-- `epsilon` accepted in signature for interface uniformity; unused (arb is fully determined by `fair_price` vs marginal prices).
-- Implemented with `lax.fori_loop` for JAX compatibility inside engine's `lax.scan`.
+- **Buy arb** when `marginal_ask(spec, state, ε) < fair_price`: bisect on `delta_x ∈ [0, spec.max_trade_buy(state)·(1−ε)]` until `marginal_ask = fair_price`.
+- **Sell arb** when `marginal_bid(spec, state, ε) > fair_price`: bisect on `delta_x ∈ [0, spec.max_trade_sell(state)·(1−ε)]` until `marginal_bid = fair_price`.
+- Bisection bounds come from `spec.max_trade_buy/sell` — both now return `state.max_trade_x`, a hard per-trade cap that bounds bisection to a well-conditioned range.
+- Trigger evaluated at `delta_x = ε = 1e-6` (not 0) for numerical stability.
+- Returns `dx=0` when fair is inside the spread (no arb opportunity).
+- Implemented with `lax.while_loop` — stops early when `hi - lo < tol` (default `1e-6`), with `num_iters=100` as a hard cap. Compatible with engine's `lax.scan`.
 
 ---
 
@@ -178,9 +188,9 @@ Generates `max_orders`-length arrays. Count `N ~ Poisson(lam)` clipped to `max_o
 
 **`block_step(state, sim_params) → (EnvState, CycleRecord)`** *(inner, jit-compiled)*
 - **Step A**: `oracle_fn` → `epsilon`, `new_fair`
-- **Step B**: Python loop over pools (unrolled at trace time): `generic_arb_solver` → `spec.swap` → `scoring.compute_edge`
-- **Step C**: `retail_sampler` → `lax.scan` over `max_orders` slots; each slot calls `route_bisection` then per-pool `spec.swap` + `scoring.compute_edge`
-- **Step D**: Assembles `CycleRecord`, calls `update_metrics`, returns new `EnvState`
+- **Step B**: Python loop over pools (unrolled at trace time): `generic_arb_solver` → `spec.swap` → `scoring.compute_edge`; per-pool arb edge stored in `arb_edge_pp[i]`
+- **Step C**: `retail_sampler` → `lax.scan` over `max_orders` slots; each slot calls `route_bisection` then per-pool `spec.swap` + `scoring.compute_edge`; per-pool retail edge accumulated in `ret_edge_pp[j]`
+- **Step D**: Assembles `CycleRecord` (including `arb_edges_per_pool`, `retail_edges_per_pool`), calls `update_metrics`, returns new `EnvState`
 
 Edge always computed on **pre-trade** state.
 
@@ -207,11 +217,16 @@ Top-level factory. Calls `make_engine(amm_specs, ...)` internally. Returns an `E
 
 ### [amm_sim/router.py](amm_sim/router.py) — Order routing
 
-Solves: `max Σᵢ fᵢ(Δᵢ)` s.t. `Σᵢ Δᵢ = Δ, Δᵢ ≥ 0`. KKT condition: `fᵢ'(Δᵢ*) = ν` for active pools. Solution: outer bisection on `ν`; inner bisection on `Δ` to invert `fᵢ'(Δ) = ν` using `jax.grad`.
+Trader-optimal routing (best execution): each side solved as a separate convex program.
 
-**`route_bisection(specs, states, side, total_delta, num_iters_outer=32, num_iters_inner=32) → (splits: list[f32], nu_star: f32)`**
+- **Buy** `(side=0)`: `min Σᵢ curve_buy_i(Δᵢ)` s.t. `Σᵢ Δᵢ = Δ` — minimise total Y paid by buyer. `curve_buy` is convex → KKT equates marginal costs → `g(ν) = Σ fᵢ'⁻¹(ν)` is **increasing** in ν.
+- **Sell** `(side=1)`: `max Σᵢ curve_sell_i(Δᵢ)` s.t. `Σᵢ Δᵢ = Δ` — maximise total Y received by seller. `curve_sell` is concave → KKT equates marginal receipts → `g(ν)` is **decreasing** in ν.
 
-Single routing function for any AMM type. Uses `jax.grad(spec.curve_buy/sell, argnums=1)` for exact marginal prices — replacing both the old analytic `marginal_inverse_fns` path and the finite-difference fallback. Uses `lax.fori_loop` throughout to avoid `ConcretizationTypeError` when nested inside engine's retail `lax.scan`.
+KKT condition: `fᵢ'(Δᵢ*) = ν` for active pools. Solution: outer bisection on `ν` (direction flipped for buy vs sell); inner bisection on `Δ` to invert `fᵢ'(Δ) = ν` using `jax.grad`.
+
+**`route_bisection(specs, states, side, total_delta, num_iters_outer=32, num_iters_inner=32, nu_hi=1e6) → (splits: list[f32], nu_star: f32)`**
+
+Single routing function for any AMM type. Uses `jax.grad(spec.curve_buy/sell, argnums=1)` for exact marginal prices — selected via `lax.cond` so only the relevant gradient is evaluated at runtime. Per-pool bisection upper bounds (`min(total_delta, max_trade_x)`) are precomputed once before the outer loop and passed into `marginal_inverse` — a saturated pool is clamped at its cap and remaining flow absorbed by other pools. Uses `lax.fori_loop` throughout to avoid `ConcretizationTypeError` when nested inside engine's retail `lax.scan`.
 
 ---
 
@@ -229,19 +244,25 @@ Vectorised version for arrays of N trades. Used for offline analysis.
 
 **Data classes:**
 
-`CPParams` — `fee_plus`, `fee_minus`, `init_x=100`, `init_y=10000`  
-`CPState` — `reserve_x`, `reserve_y`, `gamma_plus=1-fee_plus`, `gamma_minus=1-fee_minus`
+`CPParams` — `fee_plus`, `fee_minus`, `init_x=100`, `init_y=10000`, `max_trade_x=2.0`  
+`CPState` — `reserve_x`, `reserve_y`, `gamma_plus=1-fee_plus`, `gamma_minus=1-fee_minus`, `max_trade_x`
 
 **Functions (wired into `CONSTANT_PRODUCT_AMM: AMMSpec`):**
 
-| Function | Signature | Formula |
+| Function | Signature | Formula / Rule |
 |---|---|---|
-| `cp_init` | `(CPParams) → CPState` | Sets reserves and gamma multipliers |
-| `cp_curve_buy` | `(state, delta_x) → delta_y` | `(k / (x - delta_x) - y) / gamma_plus` |
-| `cp_curve_sell` | `(state, delta_x) → delta_y` | `y - k / (x + delta_x * gamma_minus)` |
-| `cp_swap` | `(state, side, delta_x) → (state', delta_y)` | Updates `reserve_x`, `reserve_y`; fee retained in pool |
+| `cp_init` | `(CPParams) → CPState` | Sets reserves, gamma multipliers, and max_trade_x |
+| `cp_curve_buy` | `(state, delta_x) → delta_y` | `y · Δx / ((x − Δx) · γ+)` — clips Δx ≤ `max_trade_x` |
+| `cp_curve_sell` | `(state, delta_x) → delta_y` | `y · Δx · γ− / (x + Δx · γ−)` — clips Δx ≤ `max_trade_x` |
+| `cp_swap` | `(state, side, delta_x) → (state', delta_y)` | Clips to `max_trade_x`, then: Buy `rx -= Δx, ry += Δy`; Sell `rx += Δx, ry -= Δy` |
+| `cp_max_trade_buy` | `(state) → f32` | `state.max_trade_x` — hard per-trade cap |
+| `cp_max_trade_sell` | `(state) → f32` | `state.max_trade_x` — hard per-trade cap |
 
-`verify_jax_compatibility()` — Runs jit/vmap/grad checks.
+Fees are fully encoded in the curve formulas. `max_trade_x` is a hard per-trade cap on delta_x, independent of inventory, stored in state so it can be updated dynamically. Both sides use the same cap.
+
+Arb, edge, routing, and marginal inverse functions have been removed — these are now handled generically by `arb.py`, `scoring.py`, and `router.py`.
+
+`verify_jax_compatibility()` — Runs jit/vmap/grad checks (jit, vmap, grad on `cp_curve_buy`).
 
 ---
 
@@ -249,26 +270,34 @@ Vectorised version for arrays of N trades. Used for offline analysis.
 
 **Data classes:**
 
-`LinearParams` — `lam_pp` (λ++), `lam_mm` (λ--), `lam_pm` (λ+-), `lam_mp` (λ-+), `init_p_ask`, `init_p_bid`, `init_x=100`, `init_y=10000`
+`LinearParams` — `lam_pp` (λ++), `lam_mm` (λ--), `lam_pm` (λ+-), `lam_mp` (λ-+), `init_p_ask=100.2`, `init_p_bid=99.8`, `init_x=100`, `init_y=10000`, `max_trade_x=2.0`
 
-`LinearState` — `p_ask` (current ask price P+), `p_bid` (current bid price P-), `lam_pp`, `lam_mm`, `lam_pm`, `lam_mp`, `reserve_x`, `reserve_y`
+`LinearState` — `p_ask`, `p_bid`, `lam_pp`, `lam_mm`, `lam_pm`, `lam_mp`, `reserve_x`, `reserve_y`, `max_trade_x`
 
-`p_ask` and `p_bid` are the pool's absolute bid/ask prices, updated only when trades occur in `linear_swap`. `reserve_x`/`reserve_y` track net inventory and are required by `env.py` for fair price initialization and `make_obs`.
+`p_ask`/`p_bid` are absolute pool prices updated only when trades occur in `linear_swap` — the oracle no longer touches AMM state. `reserve_x`/`reserve_y` are net inventories; `reserve_y/reserve_x` gives the initial fair price used by `env.py`.
 
 **Functions (wired into `LINEAR_AMM: AMMSpec`):**
 
-| Function | Signature | Formula |
+| Function | Signature | Formula / Rule |
 |---|---|---|
-| `linear_init` | `(LinearParams) → LinearState` | Sets `p_ask`, `p_bid` from params; `reserve_x/y` from `init_x/y` |
-| `linear_curve_buy` | `(state, delta_x) → delta_y` | `(p_ask + delta_x / (2λ++)) * delta_x` |
-| `linear_curve_sell` | `(state, delta_x) → delta_y` | `max((p_bid - delta_x / (2λ--)) * delta_x, 0)` |
-| `linear_swap` | `(state, side, delta_x) → (state', delta_y)` | Updates `p_ask`, `p_bid` per cross-impact matrix; updates `reserve_x`, `reserve_y` |
+| `linear_init` | `(LinearParams) → LinearState` | Sets all fields from params including `max_trade_x` |
+| `linear_curve_buy` | `(state, delta_x) → delta_y` | `(p_ask + Δx/(2λ++))·Δx`; clips Δx ≤ `max_trade_x` |
+| `linear_curve_sell` | `(state, delta_x) → delta_y` | `max((p_bid - Δx/(2λ--))·Δx, 0)`; clips Δx ≤ `max_trade_x` |
+| `linear_swap` | `(state, side, delta_x) → (state', delta_y)` | Clips to `max_trade_x`, then updates `p_ask`, `p_bid` per cross-impact matrix and `reserve_x`, `reserve_y` |
+| `linear_max_trade_buy` | `(state) → f32` | `state.max_trade_x` — hard per-trade cap |
+| `linear_max_trade_sell` | `(state) → f32` | `state.max_trade_x` — hard per-trade cap |
 
-Price impact in `linear_swap`:
+Price impact in `linear_swap` (using clipped `eff_dx = min(delta_x, max_trade_x)`):
 - Buy `Δ+`: `p_ask += Δ+/λ++`, `p_bid += Δ+/λ-+`
 - Sell `Δ-`: `p_bid -= Δ-/λ--`, `p_ask -= Δ-/λ+-`
 
-`verify_jax_compatibility()` — Runs jit/vmap/grad checks.
+Note: cross-impact means a large sell arb that corrects `p_bid → fair` may simultaneously drag `p_ask` below fair. This is valid model behaviour, not a bug. The sanity check only verifies the arbed side is corrected.
+
+Default params: `lam_pp=200, lam_mm=200, lam_pm=100, lam_mp=100` (deep book, low impact per unit). Sanity check uses `lam_pp=lam_mm=2, lam_pm=lam_mp=1` (shallower book, larger impact).
+
+Arb, edge, routing, marginal inverse, and depth functions have been removed — handled generically by `arb.py`, `scoring.py`, and `router.py`.
+
+`verify_jax_compatibility()` — Runs jit/vmap/grad checks (jit, vmap, grad on `linear_curve_buy`; asserts `p_ask`/`p_bid`/`reserve_x` update correctly after a buy).
 
 ---
 
@@ -276,13 +305,14 @@ Price impact in `linear_swap`:
 
 - All state objects are `chex.dataclass(frozen=True)` — immutable pytrees; never mutate in-place.
 - `SimParams` fields used as loop bounds (`num_steps`, `max_orders`) must remain Python ints — they are passed as static args to `jit`.
-- Engine uses `lax.scan` for the retail order loop. `arb.py` and `router.py` use `lax.fori_loop` to avoid `ConcretizationTypeError` when nested inside the retail scan.
+- Engine uses `lax.scan` for the retail order loop. `arb.py` uses `lax.while_loop`; `router.py` uses `lax.fori_loop` to avoid `ConcretizationTypeError` when nested inside the retail scan.
 - Python loops over `num_pools` in the engine are unrolled at trace time — `num_pools` is always a static Python int.
 - Edge is always computed on the **pre-trade** state (before `swap` updates reserves).
 
 ## Adding a new AMM
 
-1. Create `amm_sim/amms/my_amm.py` with frozen `chex.dataclass` for params and state. State must include `reserve_x` and `reserve_y` fields for `env.py` compatibility.
-2. Implement `init`, `curve_buy`, `curve_sell`, `swap` using `jnp` ops only (no Python control flow on traced values).
-3. Create `MY_AMM = AMMSpec(init=..., curve_buy=..., curve_sell=..., swap=...)`.
-4. Pass `MY_AMM` in `amm_specs` to `make_env()`. No arb solver, edge function, or routing function needed — these are handled generically by `arb.py`, `scoring.py`, and `router.py` via `jax.grad` on `curve_buy`/`curve_sell`.
+1. Create `amm_sim/amms/my_amm.py` with frozen `chex.dataclass` for params and state. State must include `reserve_x`, `reserve_y`, and `max_trade_x` fields.
+2. Implement `init`, `curve_buy`, `curve_sell`, `swap` using `jnp` ops only (no Python control flow on traced values). Both curves must clip `delta_x` to `state.max_trade_x`; `swap` must also clip before updating prices/reserves.
+3. Implement `max_trade_buy(state) → state.max_trade_x` and `max_trade_sell(state) → state.max_trade_x`. These are used as bisection bounds in `arb.py` and `router.py`.
+4. Create `MY_AMM = AMMSpec(init=..., curve_buy=..., curve_sell=..., swap=..., max_trade_buy=..., max_trade_sell=...)`.
+5. Pass `MY_AMM` in `amm_specs` to `make_env()`. No arb solver, edge function, or routing function needed — these are handled generically by `arb.py`, `scoring.py`, and `router.py` via `jax.grad` on `curve_buy`/`curve_sell`.
