@@ -50,27 +50,19 @@ def make_obs(state: EnvState, sim_params: SimParams) -> jnp.ndarray:
 
 # ── Environment factory ────────────────────────────────────────────────────
 
-def make_env(amm_specs:            list[AMMSpec],
-             amm_params:            list,
-             arb_solvers:           list[Callable],
-             edge_fns:              list[Callable],
-             marginal_inverse_fns:  list = None,
-             oracle_fn:             Callable = None,
-             retail_sampler:        Callable = None):
+def make_env(amm_specs:      list[AMMSpec],
+             amm_params:      list,
+             oracle_fn:       Callable = None,
+             retail_sampler:  Callable = None):
     """
     Build the simulation environment.
 
     Parameters
     ----------
-    amm_specs             : list of AMMSpec (one per pool)
-    amm_params            : initial params for each AMM (passed to spec.init)
-    arb_solvers           : arb solver per pool — (spec, state, fair_price, epsilon) → (side, dx)
-    edge_fns              : edge function per pool — (state, side, delta_x, fair_price) → edge
-    marginal_inverse_fns  : optional list of (buy_inv_fn, sell_inv_fn) per pool
-                            Enables KKT-optimal routing via route_bisection.
-                            If None: falls back to route_bisection_numerical.
-    oracle_fn             : optional custom oracle (defaults to GBM)
-    retail_sampler        : optional custom order sampler (defaults to Poisson-LogNormal)
+    amm_specs      : list of AMMSpec (one per pool)
+    amm_params     : initial params for each AMM (passed to spec.init)
+    oracle_fn      : optional custom oracle (defaults to GBM)
+    retail_sampler : optional custom order sampler (defaults to Poisson-LogNormal)
 
     Returns
     -------
@@ -78,8 +70,7 @@ def make_env(amm_specs:            list[AMMSpec],
     """
     # Build the jit-compiled step function from the engine
     block_step = make_engine(
-        amm_specs, arb_solvers, edge_fns, marginal_inverse_fns,
-        oracle_fn, retail_sampler
+        amm_specs, oracle_fn, retail_sampler
     )
     num_pools = len(amm_specs)
 
