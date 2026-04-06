@@ -10,121 +10,133 @@ Theory:
 
     Solution: bisect on ν until g(ν) = Σᵢ fᵢ'⁻¹(ν) = Δ
 
-Interface:
-    marginal_inverse_fn(nu) → delta_i
-    State is closed over in engine._route_fn — router does not need to know about state.
+    g(ν) monotonicity differs by side:
+        Buy  (fᵢ' increasing in Δ): min cost → larger ν → larger Δᵢ* → g increases.
+        Sell (fᵢ' decreasing in Δ): max recv → larger ν → smaller Δᵢ* → g decreases.
+
+    Inner bisection inverts fᵢ'(Δ) = ν using jax.grad — exact marginal,
+    no finite-difference approximation.
 
 Uses lax.fori_loop (not lax.scan) to avoid ConcretizationTypeError when called
-inside engine.py's retail lax.scan — fori_loop handles traced carry correctly.
+inside engine.py's retail lax.scan.
 """
 
 import jax
 import jax.numpy as jnp
-from typing import Callable
 
+from amm_sim.spec import AMMSpec
 
-# ══════════════════════════════════════════════════════════════════
-# ANALYTIC ROUTER
-# ══════════════════════════════════════════════════════════════════
 
 def route_bisection(
-    marginal_inverse_fns: list[Callable],   # list of (nu) → delta_i  (state closed over)
-    total_delta: jnp.ndarray,
-    num_iters: int = 32,
-    nu_hi: float = 1e6,
+    specs:           list[AMMSpec],
+    states:          list,
+    side:            jnp.ndarray,
+    total_delta:     jnp.ndarray,
+    num_iters_outer: int   = 32,
+    num_iters_inner: int   = 32,
+    nu_hi:           float = 1e6,
 ) -> tuple[list[jnp.ndarray], jnp.ndarray]:
     """
-    Find optimal allocation across N pools via bisection on shadow price ν.
+    Find optimal allocation across N pools via nested bisection.
 
-    g(ν) = Σᵢ fᵢ'⁻¹(ν) is strictly decreasing.
-    Bisect to find ν* such that g(ν*) = total_delta.
+    Outer bisection: on shadow price ν until Σᵢ fᵢ'⁻¹(ν) = total_delta.
+    Inner bisection: per pool, invert fᵢ'(Δ) = ν using jax.grad marginals.
 
-    Uses lax.fori_loop instead of lax.scan to avoid ConcretizationTypeError
-    when called inside engine.py's retail order lax.scan.
+    Works for any AMM type — no analytic inverse functions required.
+    Uses lax.fori_loop throughout for JAX compatibility inside lax.scan.
 
     Parameters
     ----------
-    marginal_inverse_fns : list of fn(nu) → delta_i
-        State already closed over — each fn only takes nu.
-    total_delta  : total order size Δ to split (can be traced)
-    num_iters    : bisection iterations (static Python int)
-    nu_hi        : upper bound on ν (static Python float)
+    specs           : list of AMMSpec, one per pool
+    states          : list of AMM states, one per pool
+    side            : 0 = buy, 1 = sell
+    total_delta     : total order size to split across pools
+    num_iters_outer : outer bisection iterations on ν (static int)
+    num_iters_inner : inner bisection iterations per pool (static int)
+    nu_hi           : upper bound on ν (static float)
+
+    Returns
+    -------
+    splits  : list of per-pool allocations, one per pool, summing to total_delta
+    nu_star : optimal shadow price ν*
     """
-    num_pools = len(marginal_inverse_fns)
-
-    def g(nu):
-        # Total allocation at shadow price nu
-        total = jnp.float32(0.0)
-        for i in range(num_pools):   # unrolled at trace time (num_pools is static)
-            total = total + marginal_inverse_fns[i](nu)
-        return total
-
-    def bisect_body(i, carry):
-        lo, hi = carry
-        mid   = (lo + hi) * jnp.float32(0.5)
-        g_mid = g(mid)
-        lo = jnp.where(g_mid > total_delta, mid, lo)
-        hi = jnp.where(g_mid > total_delta, hi,  mid)
-        return lo, hi
-
-    lo_f, hi_f = jax.lax.fori_loop(
-        jnp.int32(0), jnp.int32(num_iters), bisect_body,
-        (jnp.float32(0.0), jnp.float32(float(nu_hi)))
-    )
-    nu_star = (lo_f + hi_f) * jnp.float32(0.5)
-    splits  = [marginal_inverse_fns[i](nu_star) for i in range(num_pools)]
-
-    return splits, nu_star
-
-
-# ══════════════════════════════════════════════════════════════════
-# NUMERICAL FALLBACK
-# ══════════════════════════════════════════════════════════════════
-
-def route_bisection_numerical(
-    specs: list,
-    states: list,
-    side: jnp.ndarray,
-    total_delta: jnp.ndarray,
-    num_iters_outer: int = 32,
-    num_iters_inner: int = 32,
-) -> tuple[list[jnp.ndarray], jnp.ndarray]:
-    """
-    Fallback router using numerical marginal inverse via nested bisection.
-    Uses lax.fori_loop throughout for JAX compatibility inside lax.scan.
-    """
-    is_buy = (side == 0)
-    eps    = total_delta * jnp.float32(1e-5) + jnp.float32(1e-8)
-
-    def curve_output(spec, state, delta):
-        return jnp.where(is_buy,
-                         spec.curve_buy(state,  delta),
-                         spec.curve_sell(state, delta))
+    is_buy    = (side == 0)
+    num_pools = len(specs)   # static — Python loop unrolled at trace time
 
     def marginal_output(spec, state, delta):
-        return (curve_output(spec, state, delta + eps)
-                - curve_output(spec, state, delta)) / eps
+        """Marginal output via jax.grad — only the relevant side is evaluated."""
+        return jax.lax.cond(
+            is_buy,
+            lambda: jax.grad(spec.curve_buy,  argnums=1)(state, delta),
+            lambda: jax.grad(spec.curve_sell, argnums=1)(state, delta),
+        )
 
-    def numerical_marginal_inverse(spec, state, nu):
-        lo = jnp.float32(0.0)
-        hi = total_delta * jnp.float32(0.9999)
-
-        def inner_body(i, carry):
-            lo, hi = carry
-            mid   = (lo + hi) * jnp.float32(0.5)
-            f_mid = marginal_output(spec, state, mid)
-            lo = jnp.where(f_mid > nu, mid, lo)
-            hi = jnp.where(f_mid > nu, hi,  mid)
-            return lo, hi
-
-        lo_f, hi_f = jax.lax.fori_loop(jnp.int32(0), jnp.int32(num_iters_inner), inner_body, (lo, hi))
-        return jnp.maximum((lo_f + hi_f) * jnp.float32(0.5), 0.0)
-
-    # Build (nu) → delta_i functions with state closed over
-    num_pools = len(specs)
-    inv_fns = [
-        (lambda s=specs[i], st=states[i]: lambda nu: numerical_marginal_inverse(s, st, nu))()
+    # Precompute per-pool bisection upper bounds once — these depend only on
+    # spec/state/total_delta, not on ν, so recomputing them inside marginal_inverse
+    # on every outer iteration is wasteful.
+    uppers = [
+        jnp.minimum(
+            total_delta,
+            jnp.where(is_buy, specs[i].max_trade_buy(states[i]),
+                              specs[i].max_trade_sell(states[i]))
+        )
         for i in range(num_pools)
     ]
 
-    return route_bisection(inv_fns, total_delta, int(num_iters_outer))
+    def marginal_inverse(spec, state, upper, nu):
+        """
+        Find Δ* such that fᵢ'(Δ*) = ν via inner bisection.
+
+        Buy  (fᵢ' increasing): fᵢ'(mid) > ν → mid too large → hi = mid.
+        Sell (fᵢ' decreasing): fᵢ'(mid) > ν → mid too small → lo = mid.
+
+        Upper bound: min(total_delta, cap_i) — no pool receives more than
+        the full order or its own inventory cap. When the bisection converges
+        to the cap, the pool is saturated and the outer bisection absorbs the
+        remaining flow into other pools via g(ν) = Σ min(capᵢ, fᵢ'⁻¹(ν)).
+        """
+        def inner_body(i, carry):
+            lo, hi   = carry
+            mid      = (lo + hi) * jnp.float32(0.5)
+            f_mid    = marginal_output(spec, state, mid)
+            above_nu = f_mid > nu
+            # Buy: above_nu → hi=mid (too large); Sell: above_nu → lo=mid (too small)
+            towards_hi = jnp.where(is_buy, ~above_nu, above_nu)
+            lo = jnp.where(towards_hi, mid, lo)
+            hi = jnp.where(towards_hi, hi,  mid)
+            return lo, hi
+
+        lo_f, hi_f = jax.lax.fori_loop(
+            0, num_iters_inner, inner_body,
+            (jnp.float32(0.0), upper)
+        )
+        return jnp.maximum((lo_f + hi_f) * jnp.float32(0.5), jnp.float32(0.0))
+
+    def g(nu):
+        """Total allocation at shadow price ν (increasing for buy, decreasing for sell)."""
+        total = jnp.float32(0.0)
+        for i in range(num_pools):   # unrolled at trace time
+            total = total + marginal_inverse(specs[i], states[i], uppers[i], nu)
+        return total
+
+    def outer_body(i, carry):
+        lo, hi  = carry
+        mid     = (lo + hi) * jnp.float32(0.5)
+        g_mid   = g(mid)
+        g_above = g_mid > total_delta
+        # Buy  (g increasing): g > Δ → ν too large  → hi = mid
+        # Sell (g decreasing): g > Δ → ν too small  → lo = mid
+        towards_hi = jnp.where(is_buy, ~g_above, g_above)
+        lo = jnp.where(towards_hi, mid, lo)
+        hi = jnp.where(towards_hi, hi,  mid)
+        return lo, hi
+
+    lo_f, hi_f = jax.lax.fori_loop(
+        0, num_iters_outer, outer_body,
+        (jnp.float32(0.0), jnp.float32(nu_hi))
+    )
+    nu_star = (lo_f + hi_f) * jnp.float32(0.5)
+    splits  = [marginal_inverse(specs[i], states[i], uppers[i], nu_star)
+               for i in range(num_pools)]
+
+    return splits, nu_star
